@@ -1,13 +1,11 @@
-# main.py (Complete MongoDB version with fixed report flow)
+# main.py (JSONbin.io version with your own bin - persistent and simple)
 import telebot
 from telebot import types
-import os
+import json
 import threading
 import time
+import requests
 from flask import Flask
-from pymongo import MongoClient
-from bson.objectid import ObjectId
-import traceback
 
 # -------------------- CONFIGURATION --------------------
 API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
@@ -16,28 +14,58 @@ CHANNEL_USERNAME = "@earning_channel24"
 BOT_USERNAME = "@jhgmaing"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"
 
-MONGO_URI = os.environ.get('MONGO_URI')
-if not MONGO_URI:
-    raise Exception("MONGO_URI environment variable not set!")
+# JSONbin.io Configuration (তোর নিজের)
+BIN_ID = "69db9a7910716a4d5de5ac79"
+MASTER_KEY = "$2a$10$Q.jxca3Wg3HLncJRJeBsF.XceuKNM6RFay0f3JE7WpalVC/G7I5S."
+ACCESS_KEY = "$2a$10$7Nb5QAYjDezYlvPsRMGxnerfh.nthYJtLF3ac54jCIucQUsS3y3Ya"
+
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{BIN_ID}"
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-Master-Key": MASTER_KEY,
+    "X-Access-Key": ACCESS_KEY
+}
 
 bot = telebot.TeleBot(API_TOKEN, parse_mode='HTML')
 app = Flask(__name__)
 
-# -------------------- MongoDB Setup --------------------
-client = MongoClient(MONGO_URI)
-db_mongo = client['antiscam_bot']
-scammers_col = db_mongo['scammers']
-admins_col = db_mongo['admins']
-groups_col = db_mongo['groups']
-users_col = db_mongo['users']
-pending_col = db_mongo['pending_reports']
-
-# Ensure owner is admin
-if not admins_col.find_one({"user_id": OWNER_ID}):
-    admins_col.insert_one({"user_id": OWNER_ID})
-
-# In-memory report state
+# In-memory database cache
+db = {
+    "scammers": [],
+    "admins": [OWNER_ID],
+    "groups": [],
+    "users": [],
+    "pending_reports": {}
+}
 user_report_state = {}
+
+# -------------------- DATABASE SYNC --------------------
+def load_db():
+    global db
+    try:
+        resp = requests.get(JSONBIN_URL, headers=HEADERS)
+        if resp.status_code == 200:
+            data = resp.json()['record']
+            db = data
+            print("[DB] Loaded from JSONbin")
+        else:
+            print(f"[DB] Load failed, status: {resp.status_code}. Initializing new bin.")
+            save_db()  # Initialize bin with default structure
+    except Exception as e:
+        print(f"[DB] Load error: {e}")
+
+def save_db():
+    try:
+        resp = requests.put(JSONBIN_URL, json=db, headers=HEADERS)
+        if resp.status_code == 200:
+            print("[DB] Saved to JSONbin")
+        else:
+            print(f"[DB] Save failed, status: {resp.status_code}")
+    except Exception as e:
+        print(f"[DB] Save error: {e}")
+
+# Load initial data
+load_db()
 
 # -------------------- HELPERS --------------------
 def is_joined(user_id):
@@ -48,7 +76,7 @@ def is_joined(user_id):
         return False
 
 def is_bot_admin(user_id):
-    return admins_col.find_one({"user_id": user_id}) is not None or user_id == OWNER_ID
+    return user_id in db['admins'] or user_id == OWNER_ID
 
 def is_group_admin(chat_id, user_id):
     try:
@@ -89,10 +117,10 @@ def run_flask():
 @bot.message_handler(commands=['start'])
 def start_command(message):
     user_id = message.from_user.id
-    # Clear any ongoing report state
     user_report_state.pop(user_id, None)
-    if not users_col.find_one({"user_id": user_id}):
-        users_col.insert_one({"user_id": user_id, "joined": time.time()})
+    if user_id not in db['users']:
+        db['users'].append(user_id)
+        save_db()
 
     if not is_joined(user_id):
         markup = types.InlineKeyboardMarkup()
@@ -122,7 +150,7 @@ def check_join_callback(call):
     else:
         bot.answer_callback_query(call.id, "এখনও জয়েন করেননি!", show_alert=True)
 
-# -------------------- CANCEL COMMAND --------------------
+# -------------------- CANCEL --------------------
 @bot.message_handler(commands=['cancel'])
 def cancel_command(message):
     user_id = message.from_user.id
@@ -132,7 +160,7 @@ def cancel_command(message):
     else:
         bot.reply_to(message, "আপনার কোনো চলমান রিপোর্ট নেই।", reply_markup=main_menu_keyboard(user_id))
 
-# -------------------- PRIVATE CHAT HANDLER --------------------
+# -------------------- PRIVATE CHAT HANDLER (Fixed) --------------------
 @bot.message_handler(func=lambda m: m.chat.type == 'private', content_types=['text', 'photo'])
 def private_message_handler(message):
     user_id = message.from_user.id
@@ -143,7 +171,6 @@ def private_message_handler(message):
         bot.reply_to(message, f"❌ চ্যানেল জয়েন আবশ্যক: {CHANNEL_USERNAME}", reply_markup=markup)
         return
 
-    # Check if user is in report flow
     if user_id in user_report_state:
         state = user_report_state[user_id]
         step = state.get('step')
@@ -157,24 +184,18 @@ def private_message_handler(message):
             if message.content_type == 'photo':
                 receive_evidence(message)
                 return
-            elif message.content_type == 'text':
-                text = message.text.strip().lower()
-                if text == 'done':
-                    finalize_report(message)
-                    return
-                else:
-                    bot.reply_to(message,
-                        "⚠️ আপনি এখন রিপোর্ট প্রক্রিয়ায় আছেন।\n"
-                        "ছবি পাঠান অথবা শেষ হলে <code>done</code> লিখুন।\n"
-                        "রিপোর্ট বাতিল করতে /cancel দিন।",
-                        parse_mode='HTML')
-                    return
-            return
-        # If step is something else, treat as normal message (should not happen)
-        bot.reply_to(message, "আপনি রিপোর্ট ফ্লোতে আছেন। সম্পূর্ণ করুন অথবা /cancel দিন।")
+            elif message.content_type == 'text' and message.text.strip().lower() == 'done':
+                finalize_report(message)
+                return
+            else:
+                bot.reply_to(message,
+                    "⚠️ আপনি এখন রিপোর্ট প্রক্রিয়ায় আছেন।\n"
+                    "ছবি পাঠান অথবা শেষ হলে <code>done</code> লিখুন।\n"
+                    "রিপোর্ট বাতিল করতে /cancel দিন।",
+                    parse_mode='HTML')
+                return
         return
 
-    # Not in flow, handle regular commands
     if message.content_type == 'text':
         text = message.text.strip()
         if text == "🚫 Report Scammer":
@@ -250,21 +271,21 @@ def finalize_report(message):
     state = user_report_state.pop(user_id, {})
     if not state.get('photos'):
         bot.reply_to(message, "❌ অন্তত একটি ছবি দিতে হবে। আবার চেষ্টা করুন।")
-        bot.send_message(user_id, "আপনি আবার রিপোর্ট শুরু করতে 'Report Scammer' বাটনে ক্লিক করুন।", reply_markup=main_menu_keyboard(user_id))
+        bot.send_message(user_id, "আপনি আবার রিপোর্ট শুরু করতে 'Report Scammer' বাটনে ক্লিক করুন.", reply_markup=main_menu_keyboard(user_id))
         return
 
-    report_doc = {
+    report_id = f"{user_id}_{int(time.time())}"
+    report_data = {
         'reporter': user_id,
         'scammer_id': state.get('scammer_id'),
         'username': state.get('username'),
         'bikash': state.get('bikash'),
         'caption': f"প্রমাণ ছবি সংখ্যা: {len(state['photos'])}",
         'evidence_files': state['photos'],
-        'timestamp': time.time(),
-        'status': 'pending'
+        'timestamp': time.time()
     }
-    result = pending_col.insert_one(report_doc)
-    report_id = str(result.inserted_id)
+    db['pending_reports'][report_id] = report_data
+    save_db()
 
     # Notify admins
     admin_markup = types.InlineKeyboardMarkup()
@@ -280,17 +301,17 @@ def finalize_report(message):
         f"💳 বিকাশ: {state.get('bikash') or 'N/A'}\n"
         f"🖼 ছবি: {len(state['photos'])} টি"
     )
-    for admin in admins_col.find():
+    for admin_id in db['admins']:
         try:
             if len(state['photos']) == 1:
-                bot.send_photo(admin['user_id'], state['photos'][0], caption=admin_text, reply_markup=admin_markup)
+                bot.send_photo(admin_id, state['photos'][0], caption=admin_text, reply_markup=admin_markup)
             else:
-                bot.send_photo(admin['user_id'], state['photos'][0], caption=admin_text, reply_markup=admin_markup)
+                bot.send_photo(admin_id, state['photos'][0], caption=admin_text, reply_markup=admin_markup)
                 media_group = [types.InputMediaPhoto(media=pid) for pid in state['photos'][1:]]
                 if media_group:
-                    bot.send_media_group(admin['user_id'], media_group)
+                    bot.send_media_group(admin_id, media_group)
         except:
-            bot.send_message(admin['user_id'], admin_text + "\n(ছবি পাঠাতে সমস্যা)", reply_markup=admin_markup)
+            bot.send_message(admin_id, admin_text + "\n(ছবি পাঠাতে সমস্যা)", reply_markup=admin_markup)
 
     bot.reply_to(message,
         "✅ রিপোর্ট জমা হয়েছে। এডমিন যাচাই করবেন।",
@@ -312,12 +333,10 @@ def show_help(message):
 
 def show_status(message):
     user_id = message.from_user.id
-    total_reports = pending_col.count_documents({"reporter": user_id})
-    is_scammer = scammers_col.find_one({"id": str(user_id)}) is not None
+    is_scammer = any(str(s['id']) == str(user_id) for s in db['scammers'])
     status = (
         f"👤 <b>আপনার স্ট্যাটাস</b>\n"
         f"├ ইউজার আইডি: <code>{user_id}</code>\n"
-        f"├ জমাকৃত রিপোর্ট: {total_reports}\n"
         f"└ স্ক্যামার তালিকায়: {'হ্যাঁ' if is_scammer else 'না'}"
     )
     bot.reply_to(message, status, reply_markup=main_menu_keyboard(user_id))
@@ -343,7 +362,7 @@ def admin_inline_handler(call):
         return
 
     if call.data == "list_scammers":
-        scammers = list(scammers_col.find().limit(30))
+        scammers = db['scammers'][:30]
         if not scammers:
             text = "কোনো স্ক্যামার নেই।"
         else:
@@ -370,52 +389,37 @@ def admin_inline_handler(call):
 def process_remove_scammer(message):
     if not is_bot_admin(message.from_user.id): return
     sid = message.text.strip()
-    result = scammers_col.delete_one({"id": sid})
-    if result.deleted_count > 0:
-        bot.reply_to(message, "✅ সরানো হয়েছে")
-    else:
-        bot.reply_to(message, "❌ পাওয়া যায়নি")
+    before = len(db['scammers'])
+    db['scammers'] = [s for s in db['scammers'] if str(s['id']) != sid]
+    after = len(db['scammers'])
+    save_db()
+    bot.reply_to(message, f"{'✅ সরানো হয়েছে' if before>after else '❌ পাওয়া যায়নি'}")
 
 def process_broadcast(message):
     if not is_bot_admin(message.from_user.id): return
     text = message.text
-    count_users = 0
-    count_groups = 0
-    for user in users_col.find():
+    count = 0
+    for uid in db['users']:
         try:
-            bot.send_message(user['user_id'], f"📢 ব্রডকাস্ট\n\n{text}")
-            count_users += 1
+            bot.send_message(uid, f"📢 ব্রডকাস্ট\n\n{text}")
+            count += 1
         except: pass
-    for group in groups_col.find():
-        try:
-            bot.send_message(group['chat_id'], f"📢 ব্রডকাস্ট\n\n{text}")
-            count_groups += 1
-        except: pass
-    total_scammers = scammers_col.count_documents({})
-    total_users = users_col.count_documents({})
-    total_groups = groups_col.count_documents({})
-    bot.reply_to(message,
-        f"✅ ব্রডকাস্ট সম্পন্ন!\n\n"
-        f"👥 মোট ইউজার: {total_users}\n"
-        f"💬 মোট গ্রুপ: {total_groups}\n"
-        f"📨 পৌঁছেছে ইউজার: {count_users}\n"
-        f"📢 পৌঁছেছে গ্রুপ: {count_groups}\n"
-        f"🚫 মোট স্ক্যামার: {total_scammers}"
-    )
+    bot.reply_to(message, f"✅ {count} জন ইউজারের কাছে পাঠানো হয়েছে।")
 
 def process_add_admin(message):
     if message.from_user.id != OWNER_ID: return
     try:
         new_id = int(message.text.strip())
-        if not admins_col.find_one({"user_id": new_id}):
-            admins_col.insert_one({"user_id": new_id})
+        if new_id not in db['admins']:
+            db['admins'].append(new_id)
+            save_db()
             bot.reply_to(message, f"✅ {new_id} এডমিন হয়েছে।")
         else:
             bot.reply_to(message, "ইতিমধ্যে এডমিন!")
     except:
         bot.reply_to(message, "ভুল ফরম্যাট!")
 
-# -------------------- APPROVAL & BAN --------------------
+# -------------------- APPROVAL --------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('app_', 'rej_')))
 def handle_approval(call):
     bot.answer_callback_query(call.id)
@@ -424,9 +428,8 @@ def handle_approval(call):
         return
 
     action, report_id = call.data.split('_', 1)
-    try:
-        report = pending_col.find_one({"_id": ObjectId(report_id)})
-    except:
+    report = db['pending_reports'].get(report_id)
+    if not report:
         bot.edit_message_caption("রিপোর্ট আর নেই।", call.message.chat.id, call.message.message_id)
         return
 
@@ -436,7 +439,8 @@ def handle_approval(call):
         try:
             bot.send_message(report['reporter'], "❌ আপনার রিপোর্ট গৃহীত হয়নি।")
         except: pass
-        pending_col.delete_one({"_id": ObjectId(report_id)})
+        del db['pending_reports'][report_id]
+        save_db()
         return
 
     # Approve
@@ -446,7 +450,8 @@ def handle_approval(call):
         return
 
     save_scammer_from_report(report, call.message, call.from_user.id)
-    pending_col.delete_one({"_id": ObjectId(report_id)})
+    del db['pending_reports'][report_id]
+    save_db()
 
 def manual_id_then_save(message, report_id, original_msg):
     if not is_bot_admin(message.from_user.id): return
@@ -454,32 +459,22 @@ def manual_id_then_save(message, report_id, original_msg):
     if not sid:
         bot.reply_to(message, "❌ বৈধ ID নয়!")
         return
-    try:
-        report = pending_col.find_one({"_id": ObjectId(report_id)})
-    except:
+    report = db['pending_reports'].get(report_id)
+    if not report:
         bot.reply_to(message, "রিপোর্ট মেয়াদোত্তীর্ণ")
         return
     report['scammer_id'] = sid
     report['username'] = uname or report.get('username')
     save_scammer_from_report(report, original_msg, message.from_user.id)
-    pending_col.delete_one({"_id": ObjectId(report_id)})
+    del db['pending_reports'][report_id]
+    save_db()
 
 def ban_scammer_in_all_groups(scammer_id):
-    """সব গ্রুপে স্ক্যামার ব্যান করার চেষ্টা করে এবং লগ করে"""
-    print(f"[BAN] Attempting to ban {scammer_id} in {groups_col.count_documents({})} groups")
-    success_count = 0
-    for group in groups_col.find():
+    for gid in db['groups']:
         try:
-            bot.ban_chat_member(group['chat_id'], scammer_id)
-            success_count += 1
-            print(f"[BAN] Successfully banned {scammer_id} in group {group['chat_id']}")
-            try:
-                bot.send_message(group['chat_id'], f"🚫 স্ক্যামার <code>{scammer_id}</code> কে গ্লোবাল ডাটাবেস থেকে ব্যান করা হয়েছে।")
-            except:
-                pass
-        except Exception as e:
-            print(f"[BAN] Failed to ban {scammer_id} in group {group['chat_id']}: {e}")
-    print(f"[BAN] Banned in {success_count} groups")
+            bot.ban_chat_member(gid, scammer_id)
+            bot.send_message(gid, f"🚫 স্ক্যামার <code>{scammer_id}</code> কে গ্লোবাল ডাটাবেস থেকে ব্যান করা হয়েছে।")
+        except: pass
 
 def save_scammer_from_report(report, message_or_call, admin_id):
     scam_data = {
@@ -487,12 +482,11 @@ def save_scammer_from_report(report, message_or_call, admin_id):
         "username": report.get('username'),
         "bikash": report.get('bikash'),
         "details": f"প্রমাণ ছবি: {len(report.get('evidence_files', []))} টি",
-        "added_by": admin_id,
-        "timestamp": time.time()
+        "added_by": admin_id
     }
-    if not scammers_col.find_one({"id": scam_data['id']}):
-        scammers_col.insert_one(scam_data)
-        # ব্যাকগ্রাউন্ডে ব্যান
+    if not any(str(s['id']) == str(scam_data['id']) for s in db['scammers']):
+        db['scammers'].append(scam_data)
+        save_db()
         threading.Thread(target=ban_scammer_in_all_groups, args=(scam_data['id'],)).start()
     try:
         bot.send_message(report['reporter'], "✅ আপনার রিপোর্ট অনুমোদিত হয়েছে এবং স্ক্যামারকে সব গ্রুপ থেকে ব্যান করা হয়েছে।")
@@ -506,18 +500,17 @@ def save_scammer_from_report(report, message_or_call, admin_id):
 @bot.message_handler(content_types=['new_chat_members'])
 def on_join(message):
     chat_id = message.chat.id
-    bot_just_added = False
+    if chat_id not in db['groups']:
+        db['groups'].append(chat_id)
+        save_db()
+
     for member in message.new_chat_members:
         if member.id == bot.get_me().id:
-            bot_just_added = True
-            if not groups_col.find_one({"chat_id": chat_id}):
-                groups_col.insert_one({"chat_id": chat_id, "added": time.time()})
-                print(f"[GROUP] Added new group: {chat_id}")
             bot.send_message(chat_id,
                 "🤖 বট অ্যাড হয়েছে। স্ক্যামার স্ক্যান শুরু হচ্ছে...\n"
                 "সম্পূর্ণ স্ক্যান করতে অ্যাডমিন /scan কমান্ড ব্যবহার করুন।")
         else:
-            scam = scammers_col.find_one({"id": str(member.id)})
+            scam = next((s for s in db['scammers'] if str(s['id']) == str(member.id)), None)
             if scam:
                 try:
                     bot.ban_chat_member(chat_id, member.id)
@@ -529,26 +522,7 @@ def on_join(message):
                         f"ইউজারনেম: {f'@{member.username}' if member.username else 'N/A'}\n"
                         f"<i>গ্লোবাল ডাটাবেসে ব্ল্যাকলিস্টেড।</i>",
                         parse_mode='HTML')
-                    print(f"[GROUP] Banned new scammer {member.id} on join in {chat_id}")
-                except Exception as e:
-                    print(f"[GROUP] Failed to ban new scammer {member.id} in {chat_id}: {e}")
-
-    if bot_just_added:
-        threading.Thread(target=scan_recent_active_users, args=(chat_id,)).start()
-
-def scan_recent_active_users(chat_id):
-    try:
-        admins = bot.get_chat_administrators(chat_id)
-        for admin in admins:
-            uid = admin.user.id
-            if scammers_col.find_one({"id": str(uid)}):
-                try:
-                    bot.ban_chat_member(chat_id, uid)
-                    bot.send_message(chat_id, f"🚫 অ্যাডমিনদের মধ্যেও স্ক্যামার পাওয়া গেছে! {uid} ব্যান করা হয়েছে।")
                 except: pass
-        bot.send_message(chat_id, "✅ প্রাথমিক স্ক্যান সম্পন্ন। আরও স্ক্যান করতে /scan কমান্ড দিন।")
-    except Exception as e:
-        print(f"Scan error: {e}")
 
 @bot.message_handler(commands=['scan'])
 def scan_command(message):
@@ -559,19 +533,17 @@ def scan_command(message):
         return
 
     bot.reply_to(message, "🔍 স্ক্যান শুরু হচ্ছে...")
+    banned = 0
     try:
         admins = bot.get_chat_administrators(message.chat.id)
-        banned = 0
         for admin in admins:
-            uid = admin.user.id
-            if scammers_col.find_one({"id": str(uid)}):
+            if any(str(s['id']) == str(admin.user.id) for s in db['scammers']):
                 try:
-                    bot.ban_chat_member(message.chat.id, uid)
+                    bot.ban_chat_member(message.chat.id, admin.user.id)
                     banned += 1
                 except: pass
         bot.reply_to(message, f"✅ স্ক্যান সম্পন্ন। {banned} জন স্ক্যামার ব্যান করা হয়েছে।")
-    except Exception as e:
-        bot.reply_to(message, f"স্ক্যান করতে সমস্যা: {e}")
+    except: pass
 
 @bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'], content_types=['text'])
 def group_text_handler(message):
@@ -599,30 +571,19 @@ def unban_command(message):
     try:
         target = message.text.split()[1]
         bot.unban_chat_member(message.chat.id, target)
-        scammers_col.delete_one({"id": target})
+        db['scammers'] = [s for s in db['scammers'] if str(s['id']) != str(target)]
+        save_db()
         bot.reply_to(message, f"✅ {target} আনব্যান ও ডাটাবেস থেকে সরানো হয়েছে।")
-    except Exception as e:
-        bot.reply_to(message, f"ত্রুটি: {e}")
+    except: pass
 
-# -------------------- GROUP TRACKING --------------------
-@bot.message_handler(content_types=['left_chat_member'])
-def on_bot_removed(message):
-    if message.left_chat_member.id == bot.get_me().id:
-        groups_col.delete_one({"chat_id": message.chat.id})
-        print(f"[GROUP] Bot removed from {message.chat.id}")
-
-# -------------------- RUN (WITH POLLING CONFLICT FIX) --------------------
+# -------------------- RUN --------------------
 if __name__ == "__main__":
     print("Bot starting...")
-    # Remove any existing webhook to ensure clean polling
     bot.remove_webhook()
-    # Start Flask in separate thread
     threading.Thread(target=run_flask, daemon=True).start()
-    # Start polling
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
         except Exception as e:
             print(f"Polling error: {e}")
-            traceback.print_exc()
             time.sleep(10)
