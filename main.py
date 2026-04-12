@@ -31,7 +31,7 @@ def load_db():
         "groups": [],
         "users": [],
         "pending_reports": {},
-        "user_report_step": {}  # track report step for each user
+        "user_report_step": {}      # step only: 'id','bikash','evidence'
     }
 
 def save_db(data):
@@ -39,6 +39,9 @@ def save_db(data):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 db = load_db()
+
+# Temporary data for report flow (to keep step tracking clean)
+report_temp = {}   # user_id -> {'scammer_id':..., 'username':..., 'bikash':..., 'photos':[]}
 
 # -------------------- HELPERS --------------------
 def is_joined(user_id):
@@ -58,12 +61,6 @@ def is_group_admin(chat_id, user_id):
     except:
         return False
 
-def get_user_link(user):
-    if user.username:
-        return f"@{user.username}"
-    else:
-        return f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
-
 def extract_id_from_text(text):
     text = text.strip()
     if text.isdigit():
@@ -77,7 +74,6 @@ def extract_id_from_text(text):
     return None, None
 
 def main_menu_keyboard(user_id):
-    """Reply keyboard for private chat"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("🚫 Report Scammer", "❓ Help")
     markup.add("📊 My Status")
@@ -129,13 +125,10 @@ def check_join_callback(call):
     else:
         bot.answer_callback_query(call.id, "এখনও জয়েন করেননি!", show_alert=True)
 
-# -------------------- PRIVATE CHAT: HANDLE TEXT (REPLY KEYBOARD) --------------------
-@bot.message_handler(func=lambda m: m.chat.type == 'private', content_types=['text'])
-def private_text_handler(message):
+# -------------------- PRIVATE CHAT HANDLER --------------------
+@bot.message_handler(func=lambda m: m.chat.type == 'private', content_types=['text', 'photo'])
+def private_message_handler(message):
     user_id = message.from_user.id
-    text = message.text.strip()
-
-    # Join check (again just in case)
     if not is_joined(user_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("📢 Join Channel", url=CHANNEL_URL))
@@ -143,33 +136,49 @@ def private_text_handler(message):
         bot.reply_to(message, f"❌ চ্যানেল জয়েন আবশ্যক: {CHANNEL_USERNAME}", reply_markup=markup)
         return
 
-    if text == "🚫 Report Scammer":
-        start_report_step1(message)
-    elif text == "❓ Help":
-        show_help(message)
-    elif text == "📊 My Status":
-        show_status(message)
-    elif text == "⚙️ Admin Panel" and is_bot_admin(user_id):
-        show_admin_panel(message)
-    elif text == "/broadcast" and is_bot_admin(user_id):
-        msg = bot.reply_to(message, "ব্রডকাস্ট মেসেজ লিখুন:")
-        bot.register_next_step_handler(msg, process_broadcast)
-    else:
-        # If user is in middle of report process
-        step = db['user_report_step'].get(str(user_id))
-        if step == 'awaiting_scammer_id':
+    # Check if user is in report flow
+    step = db['user_report_step'].get(str(user_id))
+    if step:
+        if step == 'awaiting_scammer_id' and message.content_type == 'text':
             receive_scammer_id(message)
-        elif step == 'awaiting_bikash':
+            return
+        elif step == 'awaiting_bikash' and message.content_type == 'text':
             receive_bikash(message)
+            return
         elif step == 'awaiting_evidence':
-            receive_evidence(message)
+            if message.content_type == 'photo':
+                receive_evidence(message)
+            elif message.content_type == 'text' and message.text.strip().lower() == 'done':
+                finalize_report(message)
+            else:
+                bot.reply_to(message, "ছবি পাঠান অথবা শেষ হলে 'done' লিখুন।")
+            return
+
+    # If not in flow, handle text commands / buttons
+    if message.content_type == 'text':
+        text = message.text.strip()
+        if text == "🚫 Report Scammer":
+            start_report_step1(message)
+        elif text == "❓ Help":
+            show_help(message)
+        elif text == "📊 My Status":
+            show_status(message)
+        elif text == "⚙️ Admin Panel" and is_bot_admin(user_id):
+            show_admin_panel(message)
+        elif text == "/broadcast" and is_bot_admin(user_id):
+            msg = bot.reply_to(message, "ব্রডকাস্ট মেসেজ লিখুন:")
+            bot.register_next_step_handler(msg, process_broadcast)
         else:
             bot.reply_to(message, "দয়া করে নিচের বাটন ব্যবহার করুন।", reply_markup=main_menu_keyboard(user_id))
+    else:
+        # unexpected photo outside flow
+        bot.reply_to(message, "দয়া করে আগে Report Scammer বাটনে ক্লিক করুন।")
 
-# -------------------- REPORT STEPS (BOX SYSTEM) --------------------
+# -------------------- REPORT STEPS (FIXED) --------------------
 def start_report_step1(message):
     user_id = message.from_user.id
     db['user_report_step'][str(user_id)] = 'awaiting_scammer_id'
+    report_temp.pop(user_id, None)  # clear old temp
     save_db(db)
     bot.reply_to(message,
         "🔍 <b>স্ক্যামারের Chat ID অথবা @username লিখুন:</b>\n(না জানা থাকলে <code>skip</code> লিখুন)",
@@ -188,11 +197,12 @@ def receive_scammer_id(message):
         scammer_id = sid
         username = uname
 
-    db['user_report_step'][str(user_id)] = {
-        'step': 'awaiting_bikash',
+    report_temp[user_id] = {
         'scammer_id': scammer_id,
-        'username': username
+        'username': username,
+        'photos': []
     }
+    db['user_report_step'][str(user_id)] = 'awaiting_bikash'
     save_db(db)
     bot.reply_to(message,
         "💰 <b>বিকাশ নাম্বার (যদি থাকে):</b>\n(না থাকলে <code>skip</code>)",
@@ -205,37 +215,45 @@ def receive_bikash(message):
     if bikash.lower() == 'skip':
         bikash = None
 
-    data = db['user_report_step'][str(user_id)]
-    data['bikash'] = bikash
-    data['step'] = 'awaiting_evidence'
-    db['user_report_step'][str(user_id)] = data
+    report_temp[user_id]['bikash'] = bikash
+    db['user_report_step'][str(user_id)] = 'awaiting_evidence'
     save_db(db)
     bot.reply_to(message,
-        "🖼 <b>এখন স্ক্রিনশট/ছবি পাঠান:</b>\n(একটি ছবি আবশ্যক)",
+        "🖼 <b>এখন প্রমাণ হিসেবে এক বা একাধিক ছবি পাঠান।</b>\nসব ছবি পাঠানো শেষ হলে <code>done</code> লিখুন।",
         parse_mode='HTML'
     )
 
 def receive_evidence(message):
     user_id = message.from_user.id
     if not message.photo:
-        bot.reply_to(message, "❌ দয়া করে ছবি পাঠান!")
+        bot.reply_to(message, "ছবি পাঠান অথবা 'done' লিখুন।")
+        return
+    file_id = message.photo[-1].file_id
+    report_temp[user_id]['photos'].append(file_id)
+    bot.reply_to(message, f"✅ ছবি গৃহীত হয়েছে ({len(report_temp[user_id]['photos'])} টি)। আরও পাঠাতে পারেন বা 'done' লিখুন।")
+
+def finalize_report(message):
+    user_id = message.from_user.id
+    data = report_temp.pop(user_id, {})
+    if not data.get('photos'):
+        bot.reply_to(message, "❌ অন্তত একটি ছবি দিতে হবে। আবার চেষ্টা করুন।")
+        db['user_report_step'].pop(str(user_id), None)
+        save_db(db)
         return
 
-    data = db['user_report_step'].pop(str(user_id), {})
-    file_id = message.photo[-1].file_id
-    caption = message.caption or "No additional info"
-
+    # Save report
     report_id = f"{user_id}_{int(time.time())}"
     report_data = {
         'reporter': user_id,
         'scammer_id': data.get('scammer_id'),
         'username': data.get('username'),
         'bikash': data.get('bikash'),
-        'caption': caption,
-        'evidence_file_id': file_id,
+        'caption': f"প্রমাণ ছবি সংখ্যা: {len(data['photos'])}",
+        'evidence_files': data['photos'],
         'timestamp': time.time()
     }
     db['pending_reports'][report_id] = report_data
+    db['user_report_step'].pop(str(user_id), None)
     save_db(db)
 
     # Notify admins
@@ -250,20 +268,28 @@ def receive_evidence(message):
         f"🆔 স্ক্যামার আইডি: {report_data['scammer_id'] or 'N/A'}\n"
         f"📛 ইউজারনেম: {report_data['username'] or 'N/A'}\n"
         f"💳 বিকাশ: {report_data['bikash'] or 'N/A'}\n"
-        f"📝 বিবরণ: {caption}"
+        f"🖼 ছবি: {len(data['photos'])} টি"
     )
     for admin_id in db['admins']:
         try:
-            bot.send_photo(admin_id, file_id, caption=admin_text, reply_markup=admin_markup)
-        except:
-            bot.send_message(admin_id, admin_text + "\n(ছবি পাঠানো যায়নি)", reply_markup=admin_markup)
+            # send first photo with caption, rest as media group if multiple
+            if len(data['photos']) == 1:
+                bot.send_photo(admin_id, data['photos'][0], caption=admin_text, reply_markup=admin_markup)
+            else:
+                # send first as caption, then rest as album
+                bot.send_photo(admin_id, data['photos'][0], caption=admin_text, reply_markup=admin_markup)
+                media_group = [types.InputMediaPhoto(media=pid) for pid in data['photos'][1:]]
+                if media_group:
+                    bot.send_media_group(admin_id, media_group)
+        except Exception as e:
+            bot.send_message(admin_id, admin_text + "\n(ছবি পাঠাতে সমস্যা)", reply_markup=admin_markup)
 
     bot.reply_to(message,
         "✅ রিপোর্ট জমা হয়েছে। এডমিন যাচাই করবেন।",
         reply_markup=main_menu_keyboard(user_id)
     )
 
-# -------------------- HELP & STATUS (PRIVATE) --------------------
+# -------------------- HELP & STATUS --------------------
 def show_help(message):
     help_text = (
         "📖 <b>হেল্প</b>\n\n"
@@ -354,7 +380,15 @@ def process_broadcast(message):
             bot.send_message(gid, f"📢 ব্রডকাস্ট\n\n{text}")
             count_groups += 1
         except: pass
-    bot.reply_to(message, f"✅ সম্পন্ন! ইউজার: {count_users}, গ্রুপ: {count_groups}")
+    total_scammers = len(db['scammers'])
+    bot.reply_to(message,
+        f"✅ ব্রডকাস্ট সম্পন্ন!\n\n"
+        f"👥 মোট ইউজার: {len(db['users'])}\n"
+        f"💬 মোট গ্রুপ: {len(db['groups'])}\n"
+        f"📨 পৌঁছেছে ইউজার: {count_users}\n"
+        f"📢 পৌঁছেছে গ্রুপ: {count_groups}\n"
+        f"🚫 মোট স্ক্যামার: {total_scammers}"
+    )
 
 def process_add_admin(message):
     if message.from_user.id != OWNER_ID: return
@@ -369,7 +403,7 @@ def process_add_admin(message):
     except:
         bot.reply_to(message, "ভুল ফরম্যাট!")
 
-# -------------------- APPROVAL CALLBACK (INLINE) --------------------
+# -------------------- APPROVAL CALLBACK --------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('app_', 'rej_')))
 def handle_approval(call):
     bot.answer_callback_query(call.id)
@@ -393,13 +427,12 @@ def handle_approval(call):
         save_db(db)
         return
 
-    # Approve: যদি scammer_id না থাকে, চাওয়া হবে
+    # Approve
     if not report.get('scammer_id'):
         msg = bot.send_message(call.message.chat.id, f"রিপোর্ট #{report_id}\nস্ক্যামারের Chat ID লিখুন:")
         bot.register_next_step_handler(msg, lambda m: manual_id_then_save(m, report_id, call.message))
         return
 
-    # সরাসরি সেভ
     save_scammer_from_report(report, call.message, call.from_user.id)
     del db['pending_reports'][report_id]
     save_db(db)
@@ -425,7 +458,7 @@ def save_scammer_from_report(report, message_or_call, admin_id):
         "id": report['scammer_id'],
         "username": report.get('username'),
         "bikash": report.get('bikash'),
-        "details": report.get('caption', ''),
+        "details": f"প্রমাণ ছবি: {len(report.get('evidence_files', []))} টি",
         "added_by": admin_id
     }
     if not any(str(s['id']) == str(scam_data['id']) for s in db['scammers']):
@@ -439,7 +472,7 @@ def save_scammer_from_report(report, message_or_call, admin_id):
     else:
         bot.reply_to(message_or_call, "✅ সংরক্ষিত।")
 
-# -------------------- GROUP AUTOMATION --------------------
+# -------------------- GROUP AUTOMATION (NO REPLY KEYBOARD) --------------------
 @bot.message_handler(content_types=['new_chat_members'])
 def on_join(message):
     chat_id = message.chat.id
