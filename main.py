@@ -1,4 +1,4 @@
-# main.py (JSON version with enhanced ban logging)
+# main.py (Fixed JSON version - No MongoDB)
 import telebot
 from telebot import types
 import json
@@ -30,8 +30,7 @@ def load_db():
         "admins": [OWNER_ID],
         "groups": [],
         "users": [],
-        "pending_reports": {},
-        "user_report_step": {}
+        "pending_reports": {}
     }
 
 def save_db(data):
@@ -40,8 +39,9 @@ def save_db(data):
 
 db = load_db()
 
-# Temporary storage for report flow
-report_temp = {}
+# -------------------- IN-MEMORY STATES (to avoid file IO during report) --------------------
+# user_id -> {'step': 'id'/'bikash'/'evidence', 'scammer_id':..., 'username':..., 'bikash':..., 'photos':[]}
+user_report_state = {}
 
 # -------------------- HELPERS --------------------
 def is_joined(user_id):
@@ -125,9 +125,7 @@ def check_join_callback(call):
     else:
         bot.answer_callback_query(call.id, "এখনও জয়েন করেননি!", show_alert=True)
 
-# -------------------- PRIVATE CHAT HANDLER --------------------
-db_temp_steps = {}
-
+# -------------------- PRIVATE CHAT HANDLER (FIXED STATE MANAGEMENT) --------------------
 @bot.message_handler(func=lambda m: m.chat.type == 'private', content_types=['text', 'photo'])
 def private_message_handler(message):
     user_id = message.from_user.id
@@ -138,8 +136,10 @@ def private_message_handler(message):
         bot.reply_to(message, f"❌ চ্যানেল জয়েন আবশ্যক: {CHANNEL_USERNAME}", reply_markup=markup)
         return
 
-    step = db['user_report_step'].get(str(user_id))
-    if step:
+    # Check if user is in report flow (in-memory)
+    if user_id in user_report_state:
+        state = user_report_state[user_id]
+        step = state.get('step')
         if step == 'awaiting_scammer_id' and message.content_type == 'text':
             receive_scammer_id(message)
             return
@@ -155,6 +155,7 @@ def private_message_handler(message):
                 bot.reply_to(message, "ছবি পাঠান অথবা শেষ হলে 'done' লিখুন।")
             return
 
+    # Not in flow, handle regular commands
     if message.content_type == 'text':
         text = message.text.strip()
         if text == "🚫 Report Scammer":
@@ -173,12 +174,10 @@ def private_message_handler(message):
     else:
         bot.reply_to(message, "দয়া করে আগে Report Scammer বাটনে ক্লিক করুন।")
 
-# -------------------- REPORT STEPS --------------------
+# -------------------- REPORT STEPS (IN-MEMORY) --------------------
 def start_report_step1(message):
     user_id = message.from_user.id
-    db['user_report_step'][str(user_id)] = 'awaiting_scammer_id'
-    report_temp.pop(user_id, None)
-    save_db(db)
+    user_report_state[user_id] = {'step': 'awaiting_scammer_id'}
     bot.reply_to(message,
         "🔍 <b>স্ক্যামারের Chat ID অথবা @username লিখুন:</b>\n(না জানা থাকলে <code>skip</code> লিখুন)",
         parse_mode='HTML',
@@ -196,13 +195,9 @@ def receive_scammer_id(message):
         scammer_id = sid
         username = uname
 
-    report_temp[user_id] = {
-        'scammer_id': scammer_id,
-        'username': username,
-        'photos': []
-    }
-    db['user_report_step'][str(user_id)] = 'awaiting_bikash'
-    save_db(db)
+    user_report_state[user_id]['scammer_id'] = scammer_id
+    user_report_state[user_id]['username'] = username
+    user_report_state[user_id]['step'] = 'awaiting_bikash'
     bot.reply_to(message,
         "💰 <b>বিকাশ নাম্বার (যদি থাকে):</b>\n(না থাকলে <code>skip</code>)",
         parse_mode='HTML'
@@ -214,9 +209,9 @@ def receive_bikash(message):
     if bikash.lower() == 'skip':
         bikash = None
 
-    report_temp[user_id]['bikash'] = bikash
-    db['user_report_step'][str(user_id)] = 'awaiting_evidence'
-    save_db(db)
+    user_report_state[user_id]['bikash'] = bikash
+    user_report_state[user_id]['step'] = 'awaiting_evidence'
+    user_report_state[user_id]['photos'] = []
     bot.reply_to(message,
         "🖼 <b>এখন প্রমাণ হিসেবে এক বা একাধিক ছবি পাঠান।</b>\nসব ছবি পাঠানো শেষ হলে <code>done</code> লিখুন।",
         parse_mode='HTML'
@@ -228,31 +223,28 @@ def receive_evidence(message):
         bot.reply_to(message, "ছবি পাঠান অথবা 'done' লিখুন।")
         return
     file_id = message.photo[-1].file_id
-    report_temp[user_id]['photos'].append(file_id)
-    bot.reply_to(message, f"✅ ছবি গৃহীত হয়েছে ({len(report_temp[user_id]['photos'])} টি)। আরও পাঠাতে পারেন বা 'done' লিখুন।")
+    user_report_state[user_id]['photos'].append(file_id)
+    bot.reply_to(message, f"✅ ছবি গৃহীত হয়েছে ({len(user_report_state[user_id]['photos'])} টি)। আরও পাঠাতে পারেন বা 'done' লিখুন।")
 
 def finalize_report(message):
     user_id = message.from_user.id
-    data = report_temp.pop(user_id, {})
-    if not data.get('photos'):
+    state = user_report_state.pop(user_id, {})
+    if not state.get('photos'):
         bot.reply_to(message, "❌ অন্তত একটি ছবি দিতে হবে। আবার চেষ্টা করুন।")
-        db['user_report_step'].pop(str(user_id), None)
-        save_db(db)
         bot.send_message(user_id, "আপনি আবার রিপোর্ট শুরু করতে 'Report Scammer' বাটনে ক্লিক করুন।", reply_markup=main_menu_keyboard(user_id))
         return
 
     report_id = f"{user_id}_{int(time.time())}"
     report_data = {
         'reporter': user_id,
-        'scammer_id': data.get('scammer_id'),
-        'username': data.get('username'),
-        'bikash': data.get('bikash'),
-        'caption': f"প্রমাণ ছবি সংখ্যা: {len(data['photos'])}",
-        'evidence_files': data['photos'],
+        'scammer_id': state.get('scammer_id'),
+        'username': state.get('username'),
+        'bikash': state.get('bikash'),
+        'caption': f"প্রমাণ ছবি সংখ্যা: {len(state['photos'])}",
+        'evidence_files': state['photos'],
         'timestamp': time.time()
     }
     db['pending_reports'][report_id] = report_data
-    db['user_report_step'].pop(str(user_id), None)
     save_db(db)
 
     # Notify admins
@@ -267,15 +259,15 @@ def finalize_report(message):
         f"🆔 স্ক্যামার আইডি: {report_data['scammer_id'] or 'N/A'}\n"
         f"📛 ইউজারনেম: {report_data['username'] or 'N/A'}\n"
         f"💳 বিকাশ: {report_data['bikash'] or 'N/A'}\n"
-        f"🖼 ছবি: {len(data['photos'])} টি"
+        f"🖼 ছবি: {len(state['photos'])} টি"
     )
     for admin_id in db['admins']:
         try:
-            if len(data['photos']) == 1:
-                bot.send_photo(admin_id, data['photos'][0], caption=admin_text, reply_markup=admin_markup)
+            if len(state['photos']) == 1:
+                bot.send_photo(admin_id, state['photos'][0], caption=admin_text, reply_markup=admin_markup)
             else:
-                bot.send_photo(admin_id, data['photos'][0], caption=admin_text, reply_markup=admin_markup)
-                media_group = [types.InputMediaPhoto(media=pid) for pid in data['photos'][1:]]
+                bot.send_photo(admin_id, state['photos'][0], caption=admin_text, reply_markup=admin_markup)
+                media_group = [types.InputMediaPhoto(media=pid) for pid in state['photos'][1:]]
                 if media_group:
                     bot.send_media_group(admin_id, media_group)
         except Exception as e:
@@ -480,7 +472,7 @@ def save_scammer_from_report(report, message_or_call, admin_id):
     if not any(str(s['id']) == str(scam_data['id']) for s in db['scammers']):
         db['scammers'].append(scam_data)
         save_db(db)
-        # নতুন থ্রেডে ব্যান করা হবে
+        # ব্যাকগ্রাউন্ডে ব্যান
         threading.Thread(target=ban_scammer_in_all_groups, args=(scam_data['id'],)).start()
     try:
         bot.send_message(report['reporter'], "✅ আপনার রিপোর্ট অনুমোদিত হয়েছে এবং স্ক্যামারকে সব গ্রুপ থেকে ব্যান করা হয়েছে।")
@@ -603,13 +595,17 @@ def on_bot_removed(message):
             save_db(db)
             print(f"[GROUP] Bot removed from {message.chat.id}")
 
-# -------------------- RUN --------------------
+# -------------------- RUN (WITH POLLING CONFLICT FIX) --------------------
 if __name__ == "__main__":
     print("Bot starting...")
+    # Remove any existing webhook to ensure clean polling
+    bot.remove_webhook()
+    # Start Flask in separate thread
     threading.Thread(target=run_flask, daemon=True).start()
+    # Start polling with skip_pending to ignore old updates
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+            bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
         except Exception as e:
             print(f"Polling error: {e}")
             traceback.print_exc()
