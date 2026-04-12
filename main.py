@@ -14,7 +14,7 @@ import traceback
 API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
 OWNER_ID = 8194390770
 CHANNEL_USERNAME = "@earning_channel24"
-BOT_USERNAME = "@jhgmaing"
+BOT_USERNAME = "@scammer_ban_bot"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"
 
 # GitHub Settings (তোর তথ্য আগে থেকেই বসানো)
