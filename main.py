@@ -6,7 +6,6 @@ import os
 import threading
 import time
 from flask import Flask
-import re
 
 # -------------------- CONFIGURATION --------------------
 API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
@@ -31,7 +30,7 @@ def load_db():
         "groups": [],
         "users": [],
         "pending_reports": {},
-        "user_report_step": {}      # step only: 'id','bikash','evidence'
+        "user_report_step": {}      # 'awaiting_scammer_id', 'awaiting_bikash', 'awaiting_evidence'
     }
 
 def save_db(data):
@@ -40,7 +39,7 @@ def save_db(data):
 
 db = load_db()
 
-# Temporary data for report flow (to keep step tracking clean)
+# Temporary data for report flow
 report_temp = {}   # user_id -> {'scammer_id':..., 'username':..., 'bikash':..., 'photos':[]}
 
 # -------------------- HELPERS --------------------
@@ -62,6 +61,7 @@ def is_group_admin(chat_id, user_id):
         return False
 
 def extract_id_from_text(text):
+    """ইউজারনেম বা আইডি স্ট্রিং থেকে টেলিগ্রাম চ্যাট আইডি বের করে (ব্যর্থ হলে None)"""
     text = text.strip()
     if text.isdigit():
         return text, None
@@ -69,7 +69,8 @@ def extract_id_from_text(text):
         try:
             chat = bot.get_chat(text)
             return str(chat.id), text
-        except:
+        except Exception as e:
+            print(f"Could not resolve username {text}: {e}")
             return None, text
     return None, None
 
@@ -171,14 +172,13 @@ def private_message_handler(message):
         else:
             bot.reply_to(message, "দয়া করে নিচের বাটন ব্যবহার করুন।", reply_markup=main_menu_keyboard(user_id))
     else:
-        # unexpected photo outside flow
         bot.reply_to(message, "দয়া করে আগে Report Scammer বাটনে ক্লিক করুন।")
 
-# -------------------- REPORT STEPS (FIXED) --------------------
+# -------------------- REPORT STEPS --------------------
 def start_report_step1(message):
     user_id = message.from_user.id
     db['user_report_step'][str(user_id)] = 'awaiting_scammer_id'
-    report_temp.pop(user_id, None)  # clear old temp
+    report_temp.pop(user_id, None)
     save_db(db)
     bot.reply_to(message,
         "🔍 <b>স্ক্যামারের Chat ID অথবা @username লিখুন:</b>\n(না জানা থাকলে <code>skip</code> লিখুন)",
@@ -241,7 +241,6 @@ def finalize_report(message):
         save_db(db)
         return
 
-    # Save report
     report_id = f"{user_id}_{int(time.time())}"
     report_data = {
         'reporter': user_id,
@@ -272,11 +271,9 @@ def finalize_report(message):
     )
     for admin_id in db['admins']:
         try:
-            # send first photo with caption, rest as media group if multiple
             if len(data['photos']) == 1:
                 bot.send_photo(admin_id, data['photos'][0], caption=admin_text, reply_markup=admin_markup)
             else:
-                # send first as caption, then rest as album
                 bot.send_photo(admin_id, data['photos'][0], caption=admin_text, reply_markup=admin_markup)
                 media_group = [types.InputMediaPhoto(media=pid) for pid in data['photos'][1:]]
                 if media_group:
@@ -464,33 +461,103 @@ def save_scammer_from_report(report, message_or_call, admin_id):
     if not any(str(s['id']) == str(scam_data['id']) for s in db['scammers']):
         db['scammers'].append(scam_data)
         save_db(db)
+        # নতুন স্ক্যামার অ্যাড হওয়ার সাথে সাথে সব গ্রুপে ব্যান করার চেষ্টা
+        threading.Thread(target=ban_scammer_in_all_groups, args=(scam_data['id'],)).start()
     try:
-        bot.send_message(report['reporter'], "✅ আপনার রিপোর্ট অনুমোদিত হয়েছে।")
+        bot.send_message(report['reporter'], "✅ আপনার রিপোর্ট অনুমোদিত হয়েছে এবং স্ক্যামারকে সব গ্রুপ থেকে ব্যান করা হয়েছে।")
     except: pass
     if hasattr(message_or_call, 'edit_caption'):
-        message_or_call.edit_caption(message_or_call.caption + "\n\n✅ অনুমোদিত")
+        message_or_call.edit_caption(message_or_call.caption + "\n\n✅ অনুমোদিত ও গ্রুপগুলোতে ব্যান করা হয়েছে")
     else:
-        bot.reply_to(message_or_call, "✅ সংরক্ষিত।")
+        bot.reply_to(message_or_call, "✅ সংরক্ষিত এবং গ্রুপে ব্যান করা হয়েছে।")
 
-# -------------------- GROUP AUTOMATION (NO REPLY KEYBOARD) --------------------
+# -------------------- GROUP AUTOMATION (BAN ON JOIN & SCAN) --------------------
+def ban_scammer_in_all_groups(scammer_id):
+    """সব সংরক্ষিত গ্রুপে নির্দিষ্ট স্ক্যামারকে ব্যান করার চেষ্টা করে"""
+    banned_in = []
+    for gid in db['groups']:
+        try:
+            bot.ban_chat_member(gid, scammer_id)
+            banned_in.append(str(gid))
+            try:
+                bot.send_message(gid, f"🚫 স্ক্যামার <code>{scammer_id}</code> কে গ্লোবাল ডাটাবেস থেকে ব্যান করা হয়েছে।")
+            except:
+                pass
+        except Exception as e:
+            print(f"Could not ban {scammer_id} in {gid}: {e}")
+    return banned_in
+
 @bot.message_handler(content_types=['new_chat_members'])
 def on_join(message):
     chat_id = message.chat.id
+    bot_just_added = False
     for member in message.new_chat_members:
-        scam = next((s for s in db['scammers'] if str(s['id']) == str(member.id)), None)
-        if scam:
-            try:
-                bot.ban_chat_member(chat_id, member.id)
-                link = f"tg://user?id={member.id}"
-                bot.send_message(chat_id,
-                    f"🚫 <b>সালা আইছিল টাকা মারতে ভরে দিছি!</b>\n"
-                    f"স্ক্যামার: <a href='{link}'>{member.first_name}</a>\n"
-                    f"আইডি: <code>{member.id}</code>\n"
-                    f"ইউজারনেম: {f'@{member.username}' if member.username else 'N/A'}\n"
-                    f"<i>গ্লোবাল ডাটাবেসে ব্ল্যাকলিস্টেড।</i>",
-                    parse_mode='HTML')
-            except Exception as e:
-                print("Ban error:", e)
+        if member.id == bot.get_me().id:
+            bot_just_added = True
+            if chat_id not in db['groups']:
+                db['groups'].append(chat_id)
+                save_db(db)
+            bot.send_message(chat_id,
+                "🤖 বট অ্যাড হয়েছে। স্ক্যামার স্ক্যান শুরু হচ্ছে...\n"
+                "সম্পূর্ণ স্ক্যান করতে অ্যাডমিন /scan কমান্ড ব্যবহার করুন।")
+        else:
+            scam = next((s for s in db['scammers'] if str(s['id']) == str(member.id)), None)
+            if scam:
+                try:
+                    bot.ban_chat_member(chat_id, member.id)
+                    link = f"tg://user?id={member.id}"
+                    bot.send_message(chat_id,
+                        f"🚫 <b>সালা আইছিল টাকা মারতে ভরে দিছি!</b>\n"
+                        f"স্ক্যামার: <a href='{link}'>{member.first_name}</a>\n"
+                        f"আইডি: <code>{member.id}</code>\n"
+                        f"ইউজারনেম: {f'@{member.username}' if member.username else 'N/A'}\n"
+                        f"<i>গ্লোবাল ডাটাবেসে ব্ল্যাকলিস্টেড।</i>",
+                        parse_mode='HTML')
+                except Exception as e:
+                    print("Ban error:", e)
+
+    if bot_just_added:
+        threading.Thread(target=scan_recent_active_users, args=(chat_id,)).start()
+
+def scan_recent_active_users(chat_id):
+    """গ্রুপে নতুন বট অ্যাড হলে অ্যাডমিনদের মাঝে স্ক্যামার চেক করে ব্যান করে"""
+    try:
+        admins = bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            uid = admin.user.id
+            if any(str(s['id']) == str(uid) for s in db['scammers']):
+                try:
+                    bot.ban_chat_member(chat_id, uid)
+                    bot.send_message(chat_id, f"🚫 অ্যাডমিনদের মধ্যেও স্ক্যামার পাওয়া গেছে! {uid} ব্যান করা হয়েছে।")
+                except:
+                    pass
+        bot.send_message(chat_id, "✅ প্রাথমিক স্ক্যান সম্পন্ন। আরও স্ক্যান করতে /scan কমান্ড দিন।")
+    except Exception as e:
+        print(f"Scan error: {e}")
+
+@bot.message_handler(commands=['scan'])
+def scan_command(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        return
+    if not is_group_admin(message.chat.id, message.from_user.id):
+        bot.reply_to(message, "❌ শুধু গ্রুপ অ্যাডমিন এই কমান্ড ব্যবহার করতে পারবেন।")
+        return
+
+    bot.reply_to(message, "🔍 স্ক্যান শুরু হচ্ছে...")
+    try:
+        admins = bot.get_chat_administrators(message.chat.id)
+        banned = 0
+        for admin in admins:
+            uid = admin.user.id
+            if any(str(s['id']) == str(uid) for s in db['scammers']):
+                try:
+                    bot.ban_chat_member(message.chat.id, uid)
+                    banned += 1
+                except:
+                    pass
+        bot.reply_to(message, f"✅ স্ক্যান সম্পন্ন। {banned} জন স্ক্যামার ব্যান করা হয়েছে।")
+    except Exception as e:
+        bot.reply_to(message, f"স্ক্যান করতে সমস্যা: {e}")
 
 @bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'], content_types=['text'])
 def group_text_handler(message):
