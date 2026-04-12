@@ -10,15 +10,16 @@ from telebot import types
 from flask import Flask
 
 # --- কনফিগারেশন ---
-API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
-OWNER_ID = 8194390770  # আপনার চ্যাট আইডি
+# এখানে আপনার টোকেনটি সরাসরি দেওয়া আছে, আবার ভেরিয়েবল এর নামও BOT_TOKEN
+BOT_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
+OWNER_ID = 8194390770 
 CHANNEL_USERNAME = '@earning_channel24'
 CHANNEL_URL = 'https://t.me/earning_channel24'
 
-bot = telebot.TeleBot(API_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN)
 server = Flask(__name__)
 
-# --- রেন্ডার পোর্ট বাইন্ডিং (Fixes "No open ports detected") ---
+# --- রেন্ডার পোর্ট বাইন্ডিং ---
 @server.route('/')
 def home():
     return "Scammer Ban Bot is active!"
@@ -46,7 +47,7 @@ def check_join(user_id):
         status = bot.get_chat_member(CHANNEL_USERNAME, user_id).status
         return status in ['member', 'administrator', 'creator']
     except:
-        return True # বট এডমিন না থাকলে চেক বাইপাস
+        return True
 
 def is_scammer(user_id=None, username=None, bkash_list=None):
     conn = sqlite3.connect('scammers.db')
@@ -55,7 +56,7 @@ def is_scammer(user_id=None, username=None, bkash_list=None):
     if user_id:
         res = cursor.execute("SELECT * FROM scammers WHERE chat_id=?", (user_id,)).fetchone()
     if not res and username:
-        res = cursor.execute("SELECT * FROM scammers WHERE username=?", (username.lower(),)).fetchone()
+        res = cursor.execute("SELECT * FROM scammers WHERE username=?", (str(username).lower(),)).fetchone()
     if not res and bkash_list:
         for num in bkash_list:
             res = cursor.execute("SELECT * FROM scammers WHERE bkash LIKE ?", (f'%{num}%',)).fetchone()
@@ -70,10 +71,10 @@ def is_admin(user_id):
     conn.close()
     return res is not None
 
-# --- অটো ডিটেকশন ও ব্যান ---
+# --- অটো ব্যান ও ডিটেকশন ---
 @bot.message_handler(func=lambda m: True, content_types=['text', 'new_chat_members'])
-def auto_ban_handler(message):
-    # স্ট্যাটাস সেভ (ব্রডকাস্টের জন্য)
+def auto_handler(message):
+    # স্ট্যাটাস সেভ
     conn = sqlite3.connect('scammers.db')
     conn.execute("INSERT OR IGNORE INTO stats (id) VALUES (?)", (message.chat.id,))
     conn.commit()
@@ -106,16 +107,16 @@ def auto_ban_handler(message):
 
         # বোট মেনশন করলে রেসপন্স
         if f"@{bot.get_me().username}" in text:
-            bot.reply_to(message, "আমি লাইভ আছি! এই গ্রুপে কোনো স্ক্যামার ডুকলে বা টাকা মারার চেষ্টা করলে সাথে সাথে কিক দেওয়া হবে। 🔥")
+            bot.reply_to(message, "আমি লাইভ আছি! কোনো স্ক্যামার ডুকলে সাথে সাথে কিক দেওয়া হবে। 🔥")
 
         # স্ক্যাম কী-ওয়ার্ড চেক
         keywords = ['টাকা মারছে', 'scam', 'টাকা মারে', 'স্ক্যামার', 'পেমেন্ট দেয় না']
         if any(key in text for key in keywords):
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("রিপোর্ট (Proof Submit)", url=f"https://t.me/{bot.get_me().username}?start=report"))
+            markup.add(types.InlineKeyboardButton("রিপোর্ট করুন (Proof Submit)", url=f"https://t.me/{bot.get_me().username}?start=report"))
             bot.reply_to(message, "⚠️ এই ইউজার কি স্ক্যাম করেছে? প্রমান থাকলে নিচের বাটনে ক্লিক করে রিপোর্ট দিন।", reply_markup=markup)
 
-# --- প্রাইভেট চ্যাট কমান্ডস ---
+# --- প্রাইভেট কমান্ডস ---
 @bot.message_handler(commands=['start'], chat_types=['private'])
 def start(message):
     if "/start report" in message.text:
@@ -126,17 +127,17 @@ def start(message):
     markup.add(types.InlineKeyboardButton("Report Scammer 🚩", callback_data="report"),
                types.InlineKeyboardButton("Help ❓", callback_data="help"))
     
-    bot.send_message(message.chat.id, f"স্বাগতম! আমি @{bot.get_me().username}।\nস্ক্যামার মুক্ত টেলিগ্রাম গড়তে আমরা কাজ করছি।\n\nDeveloper: @jhgmaing & @bot_developer_io", reply_markup=markup)
+    bot.send_message(message.chat.id, f"স্বাগতম! আমি @{bot.get_me().username}।\n\nDeveloper: @jhgmaing & @bot_developer_io", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
-def handle_query(call):
+def query_handler(call):
     if call.data == "report":
         if not check_join(call.from_user.id):
             bot.answer_callback_query(call.id, "আগে চ্যানেলে জয়েন করুন!", show_alert=True)
             return
         start_report(call.message)
     elif call.data == "help":
-        bot.send_message(call.message.chat.id, "বটটিকে আপনার গ্রুপে এডমিন করুন। কোনো স্ক্যামার জয়েন করলেই বোট অটো ব্যান করবে।")
+        bot.send_message(call.message.chat.id, "বটটিকে গ্রুপে এডমিন করুন। স্ক্যামার জয়েন করলেই বোট অটো ব্যান করবে।")
     elif call.data.startswith("approve_"):
         if call.from_user.id != OWNER_ID: return
         _, sid, suser, bkash = call.data.split("_")
@@ -146,7 +147,6 @@ def handle_query(call):
         conn.close()
         bot.edit_message_text(f"✅ Scammer Added to DB!\nTarget: {sid if sid != '0' else suser}", call.message.chat.id, call.message.message_id)
 
-# --- রিপোর্ট সাবমিশন ফ্লো ---
 def start_report(message):
     bot.send_message(message.chat.id, "স্ক্যামারের Chat ID অথবা Username দিন:")
     bot.register_next_step_handler(message, get_proof)
@@ -162,14 +162,14 @@ def get_bkash(message, target):
 
 def finish_report(message, target):
     bkash = message.text
-    bot.send_message(message.chat.id, "✅ আপনার রিপোর্ট জমা হয়েছে। এডমিন প্রমান দেখে ব্যবস্থা নিবে।")
+    bot.send_message(message.chat.id, "✅ আপনার রিপোর্ট জমা হয়েছে। এডমিন ব্যবস্থা নিবে।")
     
     markup = types.InlineKeyboardMarkup()
     scam_id = target if target.isdigit() else "0"
     scam_user = target.replace("@", "").lower() if not target.isdigit() else "none"
     markup.add(types.InlineKeyboardButton("Approve Scammer ✅", callback_data=f"approve_{scam_id}_{scam_user}_{bkash}"))
     
-    bot.send_message(OWNER_ID, f"🔔 **New Scam Report**\n\nTarget: {target}\nbKash: {bkash}\nReporter: @{message.from_user.username}", reply_markup=markup)
+    bot.send_message(OWNER_ID, f"🔔 **New Report**\nTarget: {target}\nbKash: {bkash}\nReporter: @{message.from_user.username}", reply_markup=markup)
 
 # --- এডমিন কমান্ডস ---
 @bot.message_handler(commands=['broadcast'])
@@ -193,10 +193,10 @@ def unban(message):
             conn.execute("DELETE FROM scammers WHERE chat_id=? OR username=?", (target, target.replace("@", "").lower()))
             conn.commit()
             conn.close()
-            bot.reply_to(message, f"User {target} has been unbanned from Database.")
+            bot.reply_to(message, f"User {target} unbanned.")
         except: pass
 
-# --- বট স্টার্ট ---
+# --- স্টার্ট ---
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     bot.remove_webhook()
