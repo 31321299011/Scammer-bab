@@ -1,21 +1,31 @@
-# main.py (Telegram Channel as Database via Pinned Message)
+# main.py - GitHub Database for Scammer-bab (Final Working)
 import telebot
 from telebot import types
 import json
+import os
 import threading
 import time
+import requests
 from flask import Flask
+import base64
 import traceback
 
 # -------------------- CONFIGURATION --------------------
 API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
 OWNER_ID = 8194390770
 CHANNEL_USERNAME = "@earning_channel24"
-BOT_USERNAME = "@scammer_ban_bot"
+BOT_USERNAME = "@jhgmaing"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"
 
-# তোমার ডাটাবেস চ্যানেলের Chat ID
-DB_CHANNEL_ID = 3991282017  # পজিটিভ আইডি
+# GitHub Settings (তোর তথ্য আগে থেকেই বসানো)
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # Render-এ সেট করবি
+GITHUB_REPO_OWNER = "31321299011"              # তোর ইউজারনেম (সংখ্যা)
+GITHUB_REPO_NAME = "Scammer-bab"               # তোর রিপোর নাম
+GITHUB_FILE_PATH = "database.json"             # ফাইল যেখানে ডাটা থাকবে
+GITHUB_BRANCH = "main"                         # অথবা "master"
+
+if not GITHUB_TOKEN:
+    raise Exception("GITHUB_TOKEN environment variable not set!")
 
 bot = telebot.TeleBot(API_TOKEN, parse_mode='HTML')
 app = Flask(__name__)
@@ -30,67 +40,66 @@ db = {
 }
 user_report_state = {}
 
-# -------------------- DATABASE SYNC (PINNED MESSAGE) --------------------
-def save_db():
-    """Send database JSON as pinned message to channel"""
+# -------------------- GITHUB API FUNCTIONS --------------------
+def get_file_sha():
+    """Get SHA of existing database.json file (needed for update)"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_FILE_PATH}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     try:
-        # Convert db to JSON string
-        json_str = json.dumps(db, ensure_ascii=False, indent=2)
-        # Send as document if too large, else as text
-        if len(json_str) > 3500:
-            # Send as file
-            msg = bot.send_document(DB_CHANNEL_ID, ('database.json', json_str.encode('utf-8')), caption="📦 Database Backup")
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()['sha']
+    except:
+        pass
+    return None
+
+def load_db():
+    """Load database.json from GitHub into memory"""
+    global db
+    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_FILE_PATH}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    try:
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            content = resp.json()['content']
+            decoded = base64.b64decode(content).decode('utf-8')
+            loaded_db = json.loads(decoded)
+            db = loaded_db
+            print("[DB] Loaded from GitHub")
+            return True
         else:
-            msg = bot.send_message(DB_CHANNEL_ID, f"📦 DB:\n<pre>{json_str}</pre>", parse_mode='HTML')
-        
-        # Unpin previous pinned message (if any)
-        try:
-            chat = bot.get_chat(DB_CHANNEL_ID)
-            if chat.pinned_message:
-                bot.unpin_chat_message(DB_CHANNEL_ID, chat.pinned_message.message_id)
-        except:
-            pass
-        
-        # Pin new message
-        bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
-        print("[DB] Saved and pinned in channel")
+            print(f"[DB] Load failed: {resp.status_code}, initializing new db")
+            save_db()  # Create file with default db
+    except Exception as e:
+        print(f"[DB] Load error: {e}")
+    return False
+
+def save_db():
+    """Save current db to GitHub (create or update database.json)"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_FILE_PATH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    content = json.dumps(db, ensure_ascii=False)
+    encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+
+    sha = get_file_sha()
+    data = {
+        "message": "Update database",
+        "content": encoded,
+        "branch": GITHUB_BRANCH
+    }
+    if sha:
+        data["sha"] = sha
+
+    try:
+        resp = requests.put(url, json=data, headers=headers)
+        if resp.status_code in [200, 201]:
+            print("[DB] Saved to GitHub")
+        else:
+            print(f"[DB] Save failed: {resp.status_code} - {resp.text}")
     except Exception as e:
         print(f"[DB] Save error: {e}")
 
-def load_db():
-    """Load database from pinned message in channel"""
-    global db
-    try:
-        chat = bot.get_chat(DB_CHANNEL_ID)
-        if chat.pinned_message:
-            pinned = chat.pinned_message
-            if pinned.document:
-                # Download and parse JSON
-                file_info = bot.get_file(pinned.document.file_id)
-                downloaded = bot.download_file(file_info.file_path)
-                loaded_db = json.loads(downloaded.decode('utf-8'))
-                db = loaded_db
-                print("[DB] Loaded from pinned document")
-            elif pinned.text:
-                # Extract JSON from text (format: 📦 DB:\n<pre>{...}</pre>)
-                import re
-                match = re.search(r'<pre>(.*?)</pre>', pinned.text, re.DOTALL)
-                if match:
-                    loaded_db = json.loads(match.group(1))
-                    db = loaded_db
-                else:
-                    # Fallback: whole text after "DB:"
-                    json_str = pinned.text.split('DB:',1)[1].strip()
-                    loaded_db = json.loads(json_str)
-                    db = loaded_db
-                print("[DB] Loaded from pinned text")
-        else:
-            print("[DB] No pinned message, starting fresh")
-            save_db()  # Save initial empty db
-    except Exception as e:
-        print(f"[DB] Load error: {e}")
-
-# Load initial data
+# Initial load
 load_db()
 
 # -------------------- HELPERS --------------------
