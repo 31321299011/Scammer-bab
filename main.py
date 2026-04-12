@@ -1,4 +1,4 @@
-# main.py (JSON version - no MongoDB)
+# main.py (JSON version with enhanced ban logging)
 import telebot
 from telebot import types
 import json
@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from flask import Flask
+import traceback
 
 # -------------------- CONFIGURATION --------------------
 API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
@@ -42,7 +43,7 @@ db = load_db()
 # Temporary storage for report flow
 report_temp = {}
 
-# -------------------- HELPERS (same as before) --------------------
+# -------------------- HELPERS --------------------
 def is_joined(user_id):
     try:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
@@ -172,7 +173,7 @@ def private_message_handler(message):
     else:
         bot.reply_to(message, "দয়া করে আগে Report Scammer বাটনে ক্লিক করুন।")
 
-# -------------------- REPORT STEPS (SAME) --------------------
+# -------------------- REPORT STEPS --------------------
 def start_report_step1(message):
     user_id = message.from_user.id
     db['user_report_step'][str(user_id)] = 'awaiting_scammer_id'
@@ -285,7 +286,7 @@ def finalize_report(message):
         reply_markup=main_menu_keyboard(user_id)
     )
 
-# -------------------- HELP & STATUS (SAME) --------------------
+# -------------------- HELP & STATUS --------------------
 def show_help(message):
     help_text = (
         "📖 <b>হেল্প</b>\n\n"
@@ -309,7 +310,7 @@ def show_status(message):
     )
     bot.reply_to(message, status, reply_markup=main_menu_keyboard(user_id))
 
-# -------------------- ADMIN PANEL (INLINE) --------------------
+# -------------------- ADMIN PANEL --------------------
 def show_admin_panel(message):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -401,7 +402,7 @@ def process_add_admin(message):
     except:
         bot.reply_to(message, "ভুল ফরম্যাট!")
 
-# -------------------- APPROVAL --------------------
+# -------------------- APPROVAL & BAN --------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('app_', 'rej_')))
 def handle_approval(call):
     bot.answer_callback_query(call.id)
@@ -452,14 +453,21 @@ def manual_id_then_save(message, report_id, original_msg):
     save_db(db)
 
 def ban_scammer_in_all_groups(scammer_id):
+    """সব গ্রুপে স্ক্যামার ব্যান করার চেষ্টা করে এবং লগ করে"""
+    print(f"[BAN] Attempting to ban {scammer_id} in {len(db['groups'])} groups")
+    success_count = 0
     for gid in db['groups']:
         try:
             bot.ban_chat_member(gid, scammer_id)
+            success_count += 1
+            print(f"[BAN] Successfully banned {scammer_id} in group {gid}")
             try:
                 bot.send_message(gid, f"🚫 স্ক্যামার <code>{scammer_id}</code> কে গ্লোবাল ডাটাবেস থেকে ব্যান করা হয়েছে।")
-            except: pass
+            except:
+                pass
         except Exception as e:
-            print(f"Ban error: {e}")
+            print(f"[BAN] Failed to ban {scammer_id} in group {gid}: {e}")
+    print(f"[BAN] Banned in {success_count}/{len(db['groups'])} groups")
 
 def save_scammer_from_report(report, message_or_call, admin_id):
     scam_data = {
@@ -472,6 +480,7 @@ def save_scammer_from_report(report, message_or_call, admin_id):
     if not any(str(s['id']) == str(scam_data['id']) for s in db['scammers']):
         db['scammers'].append(scam_data)
         save_db(db)
+        # নতুন থ্রেডে ব্যান করা হবে
         threading.Thread(target=ban_scammer_in_all_groups, args=(scam_data['id'],)).start()
     try:
         bot.send_message(report['reporter'], "✅ আপনার রিপোর্ট অনুমোদিত হয়েছে এবং স্ক্যামারকে সব গ্রুপ থেকে ব্যান করা হয়েছে।")
@@ -481,7 +490,7 @@ def save_scammer_from_report(report, message_or_call, admin_id):
     else:
         bot.reply_to(message_or_call, "✅ সংরক্ষিত এবং গ্রুপে ব্যান করা হয়েছে।")
 
-# -------------------- GROUP AUTOMATION (SAME) --------------------
+# -------------------- GROUP AUTOMATION --------------------
 @bot.message_handler(content_types=['new_chat_members'])
 def on_join(message):
     chat_id = message.chat.id
@@ -492,6 +501,7 @@ def on_join(message):
             if chat_id not in db['groups']:
                 db['groups'].append(chat_id)
                 save_db(db)
+                print(f"[GROUP] Added new group: {chat_id}")
             bot.send_message(chat_id,
                 "🤖 বট অ্যাড হয়েছে। স্ক্যামার স্ক্যান শুরু হচ্ছে...\n"
                 "সম্পূর্ণ স্ক্যান করতে অ্যাডমিন /scan কমান্ড ব্যবহার করুন।")
@@ -508,8 +518,9 @@ def on_join(message):
                         f"ইউজারনেম: {f'@{member.username}' if member.username else 'N/A'}\n"
                         f"<i>গ্লোবাল ডাটাবেসে ব্ল্যাকলিস্টেড।</i>",
                         parse_mode='HTML')
+                    print(f"[GROUP] Banned new scammer {member.id} on join in {chat_id}")
                 except Exception as e:
-                    print("Ban error:", e)
+                    print(f"[GROUP] Failed to ban new scammer {member.id} in {chat_id}: {e}")
 
     if bot_just_added:
         threading.Thread(target=scan_recent_active_users, args=(chat_id,)).start()
@@ -590,6 +601,7 @@ def on_bot_removed(message):
         if message.chat.id in db['groups']:
             db['groups'].remove(message.chat.id)
             save_db(db)
+            print(f"[GROUP] Bot removed from {message.chat.id}")
 
 # -------------------- RUN --------------------
 if __name__ == "__main__":
@@ -600,4 +612,5 @@ if __name__ == "__main__":
             bot.infinity_polling(timeout=60, long_polling_timeout=60)
         except Exception as e:
             print(f"Polling error: {e}")
+            traceback.print_exc()
             time.sleep(10)
