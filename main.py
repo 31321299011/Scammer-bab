@@ -1,31 +1,31 @@
-# main.py - GitHub Database for Scammer-bab (Final Working)
+# main.py - Anti-Scam Bot with JSONbin Persistent Storage (Final)
 import telebot
 from telebot import types
 import json
-import os
 import threading
 import time
 import requests
 from flask import Flask
-import base64
 import traceback
 
 # -------------------- CONFIGURATION --------------------
 API_TOKEN = '8667512297:AAErWpDz5wWqkvJw5HqpS31F-rzvXNRAkrQ'
 OWNER_ID = 8194390770
 CHANNEL_USERNAME = "@earning_channel24"
-BOT_USERNAME = "@scammer_ban_bot"
+BOT_USERNAME = "@jhgmaing"
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"
 
-# GitHub Settings (তোর তথ্য আগে থেকেই বসানো)
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # Render-এ সেট করবি
-GITHUB_REPO_OWNER = "31321299011"              # তোর ইউজারনেম (সংখ্যা)
-GITHUB_REPO_NAME = "Scammer-bab"               # তোর রিপোর নাম
-GITHUB_FILE_PATH = "database.json"             # ফাইল যেখানে ডাটা থাকবে
-GITHUB_BRANCH = "main"                         # অথবা "master"
+# JSONbin.io Configuration (তোর নতুন তথ্য)
+BIN_ID = "69dc868b856a68218929ded8"
+MASTER_KEY = "$2a$10$Q.jxca3Wg3HLncJRJeBsF.XceuKNM6RFay0f3JE7WpalVC/G7I5S."
+ACCESS_KEY = "$2a$10$7Nb5QAYjDezYlvPsRMGxnerfh.nthYJtLF3ac54jCIucQUsS3y3Ya"
 
-if not GITHUB_TOKEN:
-    raise Exception("GITHUB_TOKEN environment variable not set!")
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{BIN_ID}"
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-Master-Key": MASTER_KEY,
+    "X-Access-Key": ACCESS_KEY
+}
 
 bot = telebot.TeleBot(API_TOKEN, parse_mode='HTML')
 app = Flask(__name__)
@@ -40,66 +40,32 @@ db = {
 }
 user_report_state = {}
 
-# -------------------- GITHUB API FUNCTIONS --------------------
-def get_file_sha():
-    """Get SHA of existing database.json file (needed for update)"""
-    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_FILE_PATH}?ref={GITHUB_BRANCH}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    try:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            return resp.json()['sha']
-    except:
-        pass
-    return None
-
+# -------------------- DATABASE SYNC --------------------
 def load_db():
-    """Load database.json from GitHub into memory"""
     global db
-    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_FILE_PATH}?ref={GITHUB_BRANCH}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     try:
-        resp = requests.get(url, headers=headers)
+        resp = requests.get(JSONBIN_URL, headers=HEADERS)
         if resp.status_code == 200:
-            content = resp.json()['content']
-            decoded = base64.b64decode(content).decode('utf-8')
-            loaded_db = json.loads(decoded)
-            db = loaded_db
-            print("[DB] Loaded from GitHub")
-            return True
+            data = resp.json()['record']
+            db = data
+            print("[DB] Loaded from JSONbin")
         else:
-            print(f"[DB] Load failed: {resp.status_code}, initializing new db")
-            save_db()  # Create file with default db
+            print(f"[DB] Load failed (status {resp.status_code}), initializing new bin")
+            save_db()
     except Exception as e:
         print(f"[DB] Load error: {e}")
-    return False
 
 def save_db():
-    """Save current db to GitHub (create or update database.json)"""
-    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_FILE_PATH}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    content = json.dumps(db, ensure_ascii=False)
-    encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-
-    sha = get_file_sha()
-    data = {
-        "message": "Update database",
-        "content": encoded,
-        "branch": GITHUB_BRANCH
-    }
-    if sha:
-        data["sha"] = sha
-
     try:
-        resp = requests.put(url, json=data, headers=headers)
-        if resp.status_code in [200, 201]:
-            print("[DB] Saved to GitHub")
+        resp = requests.put(JSONBIN_URL, json=db, headers=HEADERS)
+        if resp.status_code == 200:
+            print("[DB] Saved to JSONbin")
         else:
-            print(f"[DB] Save failed: {resp.status_code} - {resp.text}")
+            print(f"[DB] Save failed: {resp.status_code}")
     except Exception as e:
         print(f"[DB] Save error: {e}")
 
-# Initial load
+# Load initial data
 load_db()
 
 # -------------------- HELPERS --------------------
